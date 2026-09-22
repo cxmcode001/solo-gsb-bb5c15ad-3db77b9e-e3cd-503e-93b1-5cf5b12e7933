@@ -68,6 +68,43 @@
 实验的 `status`（`active` / `paused`）与 `state_version` 同时出现在创建、
 详情与列表接口的响应中，调用方可据此做乐观并发控制。
 
+## 实验级紧急揭盲（emergency unblind，双人审批）
+
+出现严重不良事件等紧急情况时，可在不逐周期推进的情况下一次性取得某受试者的
+**完整条件序列**。为防止单人越权，揭盲必须由**两位不同审批人**在
+**15 分钟授权窗口**内先后完成：
+
+- **接口** `POST /experiments/{id}/emergency-unblind`：请求体携带
+  `subject_id`、`approver_id`、`operation_id` 与必填 `reason`。
+  审批判定与最终揭盲在**单个 SQLite 写事务（`BEGIN IMMEDIATE`）**内完成；
+- **首位审批人**（同一 `(实验, operation_id)` 首次请求）开启 15 分钟窗口，
+  返回 `200` 且 `status="pending"`，响应中 `sequence` 为 `null`，
+  并回传 `window_opened_at` / `window_expires_at`；
+- **第二位不同审批人**在窗口内携带**相同** `operation_id` 再次请求时，
+  服务原子完成揭盲，返回 `200` 且 `status="completed"`，并**一次性**在
+  `sequence` 中给出该受试者的完整条件序列（与逐周期受控揭盲看到的条件一致）。
+  紧急揭盲是例外通道，**不改动常规揭盲进度**、不写 `unblindings`，且
+  **实验暂停期间仍可使用**（暂停门禁只约束常规受控揭盲）；
+- 任何**不泄露序列**的拒绝路径均返回 `409`：
+  - `duplicate_approver`：同一审批人重复批准（两位审批人必须不同）；
+  - `window_expired`：第二位审批到达时已超过
+    `window_opened_at + 15 分钟`（边界按服务端时间 `now >= expires` 判定），
+    回传 `window_expires_at`；该 `operation_id` 随即作废，须换新键重新开窗；
+  - `already_completed`：揭盲已完成后，非两位原审批人的再次请求；
+  - `operation_id_conflict`：相同 `operation_id` 绑定了不同 `subject_id`
+    或 `reason`；
+- **幂等重放**：完成后两位原审批人以相同请求体重试，返回**首次完整结果**
+  （只读重放，不重复揭盲、不多写审计）；并发的第二位审批由写事务串行化，
+  **恰好一人拿到序列**，其余得到 `already_completed` 且响应无序列；
+- 实验或受试者不存在（在开窗阶段判定）返回 `404`，**不开窗、不写审计**，
+  避免通过开窗行为探测受试者是否存在；`subject_id` / `approver_id` /
+  `operation_id` / `reason` 缺失或为空返回 `422`；
+- **审计分页** `GET /experiments/{id}/emergency-unblind-events`：追加式记录
+  每次开窗（`requested`）与第二位审批完成（`approved`），按**时间倒序**
+  （最新在前）分页，支持 `limit`（1～500，默认 100）与 `offset`。
+  审计只保存审批人、受试者、原因与窗口时间等元数据，
+  **不含任何条件 / 序列内容**，实验不存在返回 `404`。
+
 ## 快速启动（Docker Compose，一条命令）
 
 ```bash
@@ -76,11 +113,11 @@ docker compose up --build
 
 该命令会构建镜像并启动容器：构建时安装依赖，容器启动命令中再次校验依赖安装，
 应用启动钩子（lifespan）自动完成 SQLite 建表与迁移。**旧版本数据库无需手工迁移**：
-启动时新增的进度、揭盲、周期完成、单条幂等、批量揭盲、状态审计、批量状态切换表
-通过 `CREATE TABLE IF NOT EXISTS` 自动补齐，`experiments` 表新增的 `washout_seconds`、
-`status`、`state_version` 列通过幂等的 `ALTER TABLE ... DEFAULT`
-补齐——**旧实验一律按 0 秒洗脱期、运行中（active）、状态版本 0 处理**，
-旧数据保留且可继续揭盲、登记完成、暂停与恢复。
+启动时新增的进度、揭盲、周期完成、单条幂等、批量揭盲、状态审计、批量状态切换、
+紧急揭盲与紧急揭盲审计表通过 `CREATE TABLE IF NOT EXISTS` 自动补齐，
+`experiments` 表新增的 `washout_seconds`、`status`、`state_version` 列通过幂等的
+`ALTER TABLE ... DEFAULT` 补齐——**旧实验一律按 0 秒洗脱期、运行中（active）、
+状态版本 0 处理**，旧数据保留且可继续揭盲、登记完成、暂停 / 恢复与紧急揭盲。
 
 - **访问地址**：http://localhost:8000
 - **交互式 API 文档（Swagger UI）**：http://localhost:8000/docs
@@ -535,6 +572,115 @@ curl 'http://localhost:8000/experiments/<experiment_id>/state-events?limit=100&o
 - 审计记录只增不改；从未暂停 / 恢复过的实验返回 `events: []`；
 - 实验不存在返回 `404`。
 
+### 紧急揭盲（双人审批）`POST /experiments/{experiment_id}/emergency-unblind`
+
+紧急情况下一次性取得某受试者完整条件序列；必须两位**不同**审批人在
+**15 分钟窗口**内先后批准。请求体：
+
+| 字段 | 说明 |
+| --- | --- |
+| `subject_id` | 需要紧急揭盲的受试者 ID |
+| `approver_id` | 本次请求的审批人 ID；两次请求必须为不同人 |
+| `operation_id` | 本次紧急揭盲的唯一操作键（如 UUID），相同操作重试必须复用 |
+| `reason` | 紧急揭盲原因（必填，非空字符串），随审计记录持久化 |
+
+```bash
+# 1) 首位审批人开窗（200 pending，不含任何条件）
+curl -X POST http://localhost:8000/experiments/<experiment_id>/emergency-unblind \
+  -H 'Content-Type: application/json' \
+  -d '{"subject_id": "s1", "approver_id": "dr-alice",
+       "operation_id": "a3f9…", "reason": "受试者发生严重不良事件，需立即获知用药"}'
+
+# 2) 15 分钟内第二位不同审批人批准（200 completed，一次性返回完整序列）
+curl -X POST http://localhost:8000/experiments/<experiment_id>/emergency-unblind \
+  -H 'Content-Type: application/json' \
+  -d '{"subject_id": "s1", "approver_id": "dr-bob",
+       "operation_id": "a3f9…", "reason": "受试者发生严重不良事件，需立即获知用药"}'
+```
+
+首位审批人响应（`sequence` 恒为 `null`）：
+
+```json
+{
+  "experiment_id": "…",
+  "subject_id": "s1",
+  "operation_id": "a3f9…",
+  "status": "pending",
+  "first_approver_id": "dr-alice",
+  "second_approver_id": null,
+  "reason": "受试者发生严重不良事件，需立即获知用药",
+  "window_opened_at": "2026-09-22T08:00:00.000000+00:00",
+  "window_expires_at": "2026-09-22T08:15:00.000000+00:00",
+  "unblinded_at": null,
+  "sequence": null
+}
+```
+
+第二位不同审批人在窗口内批准时，响应 `status="completed"` 并一次性携带完整序列：
+
+```json
+{
+  "experiment_id": "…",
+  "subject_id": "s1",
+  "operation_id": "a3f9…",
+  "status": "completed",
+  "first_approver_id": "dr-alice",
+  "second_approver_id": "dr-bob",
+  "reason": "受试者发生严重不良事件，需立即获知用药",
+  "window_opened_at": "2026-09-22T08:00:00.000000+00:00",
+  "window_expires_at": "2026-09-22T08:15:00.000000+00:00",
+  "unblinded_at": "2026-09-22T08:04:10.000000+00:00",
+  "sequence": ["B", "A"]
+}
+```
+
+冲突一律 `409`，**响应体不含任何条件 / 序列**：
+
+- `duplicate_approver`：`approver_id` 与首位审批人相同（重复批准不续期窗口、
+  不多写审计）；
+- `window_expired`：服务端当前时间已达到 / 超过 `window_expires_at`
+  （回传该时间戳）；窗口不会延长，必须以**新的 `operation_id`** 重新申请；
+- `already_completed`：揭盲已完成，完整序列仅向两位原审批人重放；
+  其他任何 `approver_id` 再次请求均被拒绝；
+- `operation_id_conflict`：相同 `operation_id` 绑定了不同 `subject_id`
+  或不同 `reason`。
+
+幂等与并发：完成后两位原审批人以**完全相同的请求体**重试返回首次完整结果
+（只读重放）；并发的第二位审批请求由单个写事务串行化，**恰好一人得到序列**，
+其余得到 `409 already_completed`。紧急揭盲不改动常规揭盲进度（`next_period` /
+`unblindings` 不变），在实验**暂停期间同样可用**——暂停门禁只约束常规受控揭盲。
+实验或受试者不存在返回 `404`（开窗阶段判定，不开窗、不留审计）；字段缺失 / 为空
+返回 `422`。
+
+### 查询紧急揭盲审计 `GET /experiments/{experiment_id}/emergency-unblind-events`
+
+返回紧急揭盲的审批审计（开窗 `requested` / 第二位审批完成 `approved`），
+**按时间倒序**（最新在前）分页，**不含任何条件 / 序列内容**：
+
+```bash
+curl 'http://localhost:8000/experiments/<experiment_id>/emergency-unblind-events?limit=100&offset=0'
+```
+
+```json
+{
+  "experiment_id": "…",
+  "events": [
+    {"id": 2, "experiment_id": "…", "operation_id": "a3f9…", "subject_id": "s1",
+     "event": "approved", "approver_id": "dr-bob",
+     "reason": "受试者发生严重不良事件，需立即获知用药",
+     "window_opened_at": "…", "window_expires_at": "…", "created_at": "…"},
+    {"id": 1, "experiment_id": "…", "operation_id": "a3f9…", "subject_id": "s1",
+     "event": "requested", "approver_id": "dr-alice",
+     "reason": "受试者发生严重不良事件，需立即获知用药",
+     "window_opened_at": "…", "window_expires_at": "…", "created_at": "…"}
+  ]
+}
+```
+
+- `limit`：1～500，默认 `100`；`offset`：分页偏移，默认 `0`；非法值返回 `422`；
+- 审计记录只增不改，且不保存任何条件内容；从未紧急揭盲的实验返回 `events: []`；
+- 实验不存在返回 `404`。
+
 ### 其他接口
 
 - `GET /experiments/{experiment_id}`：查询实验（受试者名册 + 条件清单 +
@@ -546,7 +692,7 @@ curl 'http://localhost:8000/experiments/<experiment_id>/state-events?limit=100&o
 
 ```bash
 pip install -r requirements-dev.txt
-pytest                         # 运行测试（含序列平衡、幂等、门禁、409 并发、暂停/恢复、批量状态切换、旧库迁移校验）
+pytest                         # 运行测试（含序列平衡、幂等、门禁、409 并发、暂停/恢复、批量状态切换、紧急揭盲双人审批、旧库迁移校验）
 uvicorn app.main:app --reload  # 本地启动，默认 http://127.0.0.1:8000
 ```
 
@@ -557,7 +703,7 @@ uvicorn app.main:app --reload  # 本地启动，默认 http://127.0.0.1:8000
 - **确定性分配**（`app/main.py`）：将完整序列组复制 `受试者数 / 组大小` 份构成序列池，
   用 `random.Random(seed)` 打乱后依次映射给受试者，因此相同输入与种子结果一致。
   序列只写入服务端存储，不进入创建 / 详情响应。
-- **存储**（`app/db.py`，SQLite）共十一张表，启动时幂等迁移（旧库自动补齐）：
+- **存储**（`app/db.py`，SQLite）共十三张表，启动时幂等迁移（旧库自动补齐）：
   - `experiments`：含 `washout_seconds`、`status`（`active` / `paused`）与
     `state_version`（旧库缺列时分别 `ALTER TABLE ... DEFAULT 0 / 'active' / 0` 补齐）；
   - `assignments`：受试者完整序列（服务端持有）；
@@ -572,7 +718,14 @@ uvicorn app.main:app --reload  # 本地启动，默认 http://127.0.0.1:8000
     `action`、前后状态、`state_version`、原因、时间戳），按
     `(实验, operation_id)` 唯一约束支持操作幂等重放，查询按 `id DESC` 时间倒序；
   - `state_transition_batches`：批量状态切换按 `batch_operation_id`（全局唯一）
-    保存首次绑定的有序操作列表与首次结果（操作列表或顺序不同即 `409`）。
+    保存首次绑定的有序操作列表与首次结果（操作列表或顺序不同即 `409`）；
+  - `emergency_unblinds`：紧急揭盲按 `(实验, operation_id)` 保存双人审批状态
+    （首位审批人、15 分钟窗口起止、第二位审批人、完成时刻与完整序列）。
+    序列仅服务端持有并只随 completed 响应一次性下发给两位原审批人，
+    不进入审计表；
+  - `emergency_unblind_events`：紧急揭盲的追加式审计（`requested` /
+    `approved`），只保存审批人与窗口时间等元数据、**不含任何条件内容**，
+    查询按 `id DESC` 时间倒序分页。
 - **暂停 / 恢复的原子性**：暂停与恢复都在单个 `BEGIN IMMEDIATE` 写事务内完成
   “幂等检查 → 状态 / 版本校验 → 更新 `experiments` 并追加审计 → 提交”。
   恢复以 `state_version` 做 compare-and-set，版本不符整体回滚并返回 `409`，
@@ -594,3 +747,14 @@ uvicorn app.main:app --reload  # 本地启动，默认 http://127.0.0.1:8000
   已成功操作的重放即使在暂停期间也直接返回首次结果（只读，不重新推进）；
   未命中的新请求再经过暂停门禁，得到不含任何条件信息的 `409 experiment_paused`，
   且不写入幂等记录，恢复后原键仍可首次成功。
+- **紧急揭盲的双人审批原子性**：开窗与最终揭盲各自在单个 `BEGIN IMMEDIATE`
+  写事务内完成“`(实验, operation_id)` 幂等检查 → 实验 / 受试者存在性校验 →
+  窗口 / 审批人判定 → 更新状态并追加审计 → 提交”。服务端时间在锁内读取，
+  因此并发的第二位审批严格串行化：先提交者把状态置为 `completed` 并唯一取得序列，
+  其余请求看到已完成而得到 `409 already_completed`，不会出现两次结果。
+  完整序列只保存在 `emergency_unblinds` 中（非审计表），只随 completed 响应
+  一次性下发；同一审批人重复、窗口过期（`now >= window_expires_at`）、
+  非两位原审批人的完成后重放均在返回序列之前拦截，失败路径不携带任何条件；
+  完成后两位原审批人的重放为只读事务，返回首次序列而不重复揭盲或追加审计。
+  紧急揭盲不经过暂停门禁与常规揭盲门禁，也不写入 `unblindings` /
+  `subject_progress`，因此不会影响逐周期受控揭盲的状态。

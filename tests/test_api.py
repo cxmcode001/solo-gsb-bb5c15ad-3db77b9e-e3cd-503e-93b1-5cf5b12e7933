@@ -2582,3 +2582,644 @@ def test_legacy_database_supports_state_batch_after_migration(
         )
         assert resumed.status_code == 200
         assert migrated.get("/experiments/legacy-sb").json()["status"] == "active"
+
+
+# ---------- 实验级紧急揭盲（双人审批 + 15 分钟授权窗口） ----------
+
+def emergency_unblind(
+    client: TestClient,
+    experiment_id: str,
+    subject_id: str,
+    approver_id: str,
+    operation_id: str,
+    reason: str = "SAE 复核",
+):
+    return client.post(
+        f"/experiments/{experiment_id}/emergency-unblind",
+        json={
+            "subject_id": subject_id,
+            "approver_id": approver_id,
+            "operation_id": operation_id,
+            "reason": reason,
+        },
+    )
+
+
+def test_emergency_unblind_dual_approval_returns_full_sequence_once(
+    client: TestClient,
+) -> None:
+    body, subject_ids = create_experiment(
+        client,
+        conditions=["A", "B", "C"],
+        subject_ids=[f"s{i}" for i in range(6)],
+        seed=7,
+    )
+    eid = body["experiment_id"]
+
+    # 首个审批人开启 15 分钟授权窗口：响应不含任何条件内容
+    first = emergency_unblind(client, eid, "s0", "alice", "eu-1")
+    assert first.status_code == 200, first.text
+    opened = first.json()
+    assert opened["status"] == "pending_second_approval"
+    assert opened["experiment_id"] == eid
+    assert opened["subject_id"] == "s0"
+    assert opened["operation_id"] == "eu-1"
+    assert opened["first_approver_id"] == "alice"
+    assert "sequence" not in opened
+    assert "second_approver_id" not in opened
+    assert "revealed_at" not in opened
+    assert_no_sequence_leak(opened)
+    opened_at = datetime.fromisoformat(opened["opened_at"])
+    expires_at = datetime.fromisoformat(opened["window_expires_at"])
+    assert (expires_at - opened_at).total_seconds() == 15 * 60
+
+    # 窗口内第二个不同审批人批准：一次性返回完整条件序列
+    second = emergency_unblind(client, eid, "s0", "bob", "eu-2")
+    assert second.status_code == 200, second.text
+    unblinded = second.json()
+    assert unblinded["status"] == "unblinded"
+    assert unblinded["first_approver_id"] == "alice"
+    assert unblinded["second_approver_id"] == "bob"
+    assert unblinded["opened_at"] == opened["opened_at"]
+    assert unblinded["window_expires_at"] == opened["window_expires_at"]
+    assert "revealed_at" in unblinded
+    sequence = unblinded["sequence"]
+    assert len(sequence) == 3
+    assert sorted(sequence) == ["A", "B", "C"]
+
+    # 与逐周期推进重建的序列一致：紧急揭盲返回的是真实分配结果
+    assert sequence == reveal_sequence(client, eid, "s0", 3)
+
+    # 其他受试者不受影响
+    progress = client.get(f"/experiments/{eid}/subjects/s1/progress").json()
+    assert progress["reveals"] == []
+
+
+def test_emergency_unblind_first_approval_reveals_nothing(
+    client: TestClient,
+) -> None:
+    body, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=1
+    )
+    eid = body["experiment_id"]
+
+    resp = emergency_unblind(client, eid, "s1", "alice", "eu-open")
+    assert resp.status_code == 200
+    assert_no_sequence_leak(resp.json())
+
+    # 紧急揭盲是带外流程：不改变按周期推进的进度
+    progress = client.get(f"/experiments/{eid}/subjects/s1/progress").json()
+    assert progress["next_period"] == 1
+    assert progress["reveals"] == []
+
+
+def test_emergency_unblind_same_approver_cannot_complete(
+    client: TestClient,
+) -> None:
+    body, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=1
+    )
+    eid = body["experiment_id"]
+    assert emergency_unblind(client, eid, "s1", "alice", "eu-1").status_code == 200
+
+    # 同一审批人重复（新 operation_id）：409，不泄露序列
+    dup = emergency_unblind(client, eid, "s1", "alice", "eu-2")
+    assert dup.status_code == 409
+    detail = dup.json()["detail"]
+    assert detail["reason"] == "same_approver"
+    assert_no_sequence_leak(detail)
+
+    # 冲突不关闭窗口、不消耗 operation_id：窗口内第二个不同审批人仍可完成
+    ok = emergency_unblind(client, eid, "s1", "bob", "eu-3")
+    assert ok.status_code == 200
+    assert ok.json()["status"] == "unblinded"
+    assert len(ok.json()["sequence"]) == 2
+
+
+def test_emergency_unblind_window_expiry_blocks_and_allows_fresh_window(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "emergency-expiry.db"))
+    t0 = datetime(2026, 9, 22, 8, 0, 0, tzinfo=timezone.utc)
+
+    class Clock:
+        def __init__(self) -> None:
+            self.now = t0
+
+        def __call__(self) -> datetime:
+            return self.now
+
+    clock = Clock()
+    monkeypatch.setattr(db, "utc_now", clock)
+
+    with TestClient(app) as local:
+        created = local.post(
+            "/experiments",
+            json={"conditions": ["A", "B"], "subject_ids": ["s1", "s2"], "seed": 1},
+        ).json()
+        eid = created["experiment_id"]
+
+        opened = local.post(
+            f"/experiments/{eid}/emergency-unblind",
+            json={
+                "subject_id": "s1",
+                "approver_id": "alice",
+                "operation_id": "eu-1",
+                "reason": "SAE",
+            },
+        )
+        assert opened.status_code == 200
+        assert opened.json()["window_expires_at"] == (
+            t0 + timedelta(minutes=15)
+        ).isoformat()
+
+        # 窗口内（14 分钟）：同一审批人仍被拒，不同审批人可完成
+        clock.now = t0 + timedelta(minutes=14)
+        dup = local.post(
+            f"/experiments/{eid}/emergency-unblind",
+            json={
+                "subject_id": "s1",
+                "approver_id": "alice",
+                "operation_id": "eu-x",
+                "reason": "SAE",
+            },
+        )
+        assert dup.status_code == 409
+        assert dup.json()["detail"]["reason"] == "same_approver"
+
+        # 窗口届满后：第二审批人被拒，不泄露序列
+        clock.now = t0 + timedelta(minutes=15, seconds=1)
+        late = local.post(
+            f"/experiments/{eid}/emergency-unblind",
+            json={
+                "subject_id": "s1",
+                "approver_id": "bob",
+                "operation_id": "eu-2",
+                "reason": "SAE",
+            },
+        )
+        assert late.status_code == 409
+        detail = late.json()["detail"]
+        assert detail["reason"] == "window_expired"
+        assert_no_sequence_leak(detail)
+
+        # 过期失败不消耗 operation_id：同一 operation_id 可重新发起首个审批
+        reopened = local.post(
+            f"/experiments/{eid}/emergency-unblind",
+            json={
+                "subject_id": "s1",
+                "approver_id": "bob",
+                "operation_id": "eu-2",
+                "reason": "SAE",
+            },
+        )
+        assert reopened.status_code == 200
+        reopened_body = reopened.json()
+        assert reopened_body["status"] == "pending_second_approval"
+        assert reopened_body["first_approver_id"] == "bob"
+        assert reopened_body["window_expires_at"] == (
+            t0 + timedelta(minutes=30, seconds=1)
+        ).isoformat()
+        assert_no_sequence_leak(reopened_body)
+
+        # 新窗口内第二个不同审批人批准：正常揭盲
+        done = local.post(
+            f"/experiments/{eid}/emergency-unblind",
+            json={
+                "subject_id": "s1",
+                "approver_id": "carol",
+                "operation_id": "eu-3",
+                "reason": "SAE",
+            },
+        )
+        assert done.status_code == 200
+        done_body = done.json()
+        assert done_body["status"] == "unblinded"
+        assert done_body["first_approver_id"] == "bob"
+        assert done_body["second_approver_id"] == "carol"
+        assert sorted(done_body["sequence"]) == ["A", "B"]
+
+        # 审计完整记录整个生命周期（时间倒序），不含条件内容
+        events = local.get(
+            f"/experiments/{eid}/emergency-unblind-events"
+        ).json()["events"]
+        assert [(e["action"], e["approver_id"]) for e in events] == [
+            ("unblinded", "carol"),
+            ("window_opened", "bob"),
+            ("window_expired", "bob"),
+            ("window_opened", "alice"),
+        ]
+        # 过期审计不绑定 operation_id（失败不消耗幂等键）
+        assert events[2]["operation_id"] is None
+        assert_no_sequence_leak(events)
+
+
+def test_emergency_unblind_unknown_experiment_or_subject_returns_404(
+    client: TestClient,
+) -> None:
+    body, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=1
+    )
+    eid = body["experiment_id"]
+
+    assert (
+        emergency_unblind(client, "missing", "s1", "alice", "eu-1").status_code
+        == 404
+    )
+    ghost = emergency_unblind(client, eid, "ghost", "alice", "eu-1")
+    assert ghost.status_code == 404
+    assert_no_sequence_leak(ghost.json())
+
+    # 404 不消耗 operation_id、不产生审计记录
+    events = client.get(f"/experiments/{eid}/emergency-unblind-events").json()[
+        "events"
+    ]
+    assert events == []
+    ok = emergency_unblind(client, eid, "s1", "alice", "eu-1")
+    assert ok.status_code == 200
+
+
+def test_emergency_unblind_operation_id_replays_first_result(
+    client: TestClient,
+) -> None:
+    body, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=1
+    )
+    eid = body["experiment_id"]
+
+    first = emergency_unblind(client, eid, "s1", "alice", "eu-open")
+    assert first.status_code == 200
+    for _ in range(3):
+        replay = emergency_unblind(client, eid, "s1", "alice", "eu-open")
+        assert replay.status_code == 200
+        assert replay.json() == first.json()
+
+    done = emergency_unblind(client, eid, "s1", "bob", "eu-complete")
+    assert done.status_code == 200
+    for _ in range(3):
+        replay = emergency_unblind(client, eid, "s1", "bob", "eu-complete")
+        assert replay.status_code == 200
+        assert replay.json() == done.json()
+
+    # 重放不产生额外审计：window_opened 与 unblinded 各一条
+    events = client.get(f"/experiments/{eid}/emergency-unblind-events").json()[
+        "events"
+    ]
+    assert [e["action"] for e in events] == ["unblinded", "window_opened"]
+
+    # 完成后重放首个审批的 operation_id，仍返回首次的待审批回执（首次结果语义）
+    replay_open = emergency_unblind(client, eid, "s1", "alice", "eu-open")
+    assert replay_open.status_code == 200
+    assert replay_open.json() == first.json()
+    assert_no_sequence_leak(replay_open.json())
+
+
+def test_emergency_unblind_operation_id_conflict(client: TestClient) -> None:
+    body, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=1
+    )
+    eid = body["experiment_id"]
+    assert (
+        emergency_unblind(client, eid, "s1", "alice", "shared-op").status_code
+        == 200
+    )
+
+    # 同一 operation_id 绑定不同审批人 / 受试者 / 原因 → 409
+    for payload in (
+        {
+            "subject_id": "s1",
+            "approver_id": "bob",
+            "operation_id": "shared-op",
+            "reason": "SAE 复核",
+        },
+        {
+            "subject_id": "s2",
+            "approver_id": "alice",
+            "operation_id": "shared-op",
+            "reason": "SAE 复核",
+        },
+        {
+            "subject_id": "s1",
+            "approver_id": "alice",
+            "operation_id": "shared-op",
+            "reason": "different reason",
+        },
+    ):
+        resp = client.post(f"/experiments/{eid}/emergency-unblind", json=payload)
+        assert resp.status_code == 409
+        detail = resp.json()["detail"]
+        assert detail["reason"] == "operation_id_conflict"
+        assert detail["operation_id"] == "shared-op"
+        assert_no_sequence_leak(detail)
+
+    # 冲突不产生审计、不推进会话：窗口内第二个不同审批人仍可正常完成
+    events = client.get(f"/experiments/{eid}/emergency-unblind-events").json()[
+        "events"
+    ]
+    assert [e["action"] for e in events] == ["window_opened"]
+    ok = emergency_unblind(client, eid, "s1", "bob", "eu-2")
+    assert ok.status_code == 200
+    assert ok.json()["status"] == "unblinded"
+
+
+def test_emergency_unblind_is_one_time_per_subject(client: TestClient) -> None:
+    body, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=1
+    )
+    eid = body["experiment_id"]
+    assert emergency_unblind(client, eid, "s1", "alice", "eu-1").status_code == 200
+    completed = emergency_unblind(client, eid, "s1", "bob", "eu-2")
+    assert completed.status_code == 200
+
+    # 完成后任何新申请（无论新旧审批人）均 409，不再泄露序列
+    third = emergency_unblind(client, eid, "s1", "carol", "eu-3")
+    assert third.status_code == 409
+    assert third.json()["detail"]["reason"] == "already_unblinded"
+    assert_no_sequence_leak(third.json())
+    again = emergency_unblind(client, eid, "s1", "alice", "eu-4")
+    assert again.status_code == 409
+    assert again.json()["detail"]["reason"] == "already_unblinded"
+
+    # 失败不消耗 operation_id、不产生新审计
+    events = client.get(f"/experiments/{eid}/emergency-unblind-events").json()[
+        "events"
+    ]
+    assert [e["action"] for e in events] == ["unblinded", "window_opened"]
+
+    # 其他受试者不受影响，可独立走完整双人审批
+    assert emergency_unblind(client, eid, "s2", "alice", "eu-5").status_code == 200
+    done = emergency_unblind(client, eid, "s2", "bob", "eu-6")
+    assert done.status_code == 200
+    assert done.json()["status"] == "unblinded"
+
+
+def test_emergency_unblind_allowed_while_experiment_paused(
+    client: TestClient,
+) -> None:
+    body, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=1
+    )
+    eid = body["experiment_id"]
+    assert pause_experiment(client, eid, "hold").status_code == 200
+
+    # 紧急揭盲是破窗式带外流程，不受实验暂停状态影响
+    assert emergency_unblind(client, eid, "s1", "alice", "eu-1").status_code == 200
+    done = emergency_unblind(client, eid, "s1", "bob", "eu-2")
+    assert done.status_code == 200
+    assert done.json()["status"] == "unblinded"
+    assert len(done.json()["sequence"]) == 2
+
+
+def test_concurrent_emergency_second_approvals_have_single_winner(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "conc-emergency.db"))
+    with TestClient(app) as setup:
+        created = setup.post(
+            "/experiments",
+            json={"conditions": ["A", "B"], "subject_ids": ["s1", "s2"], "seed": 17},
+        ).json()
+        eid = created["experiment_id"]
+        assert setup.post(
+            f"/experiments/{eid}/emergency-unblind",
+            json={
+                "subject_id": "s1",
+                "approver_id": "alice",
+                "operation_id": "eu-open",
+                "reason": "SAE",
+            },
+        ).status_code == 200
+
+    n_threads = 8
+    barrier = threading.Barrier(n_threads)
+    results: list[dict] = []
+    statuses: list[int] = []
+    results_lock = threading.Lock()
+
+    def worker(i: int) -> None:
+        with TestClient(app) as local_client:
+            barrier.wait()
+            resp = local_client.post(
+                f"/experiments/{eid}/emergency-unblind",
+                json={
+                    "subject_id": "s1",
+                    "approver_id": f"approver-{i}",
+                    "operation_id": f"eu-second-{i}",
+                    "reason": "SAE",
+                },
+            )
+            with results_lock:
+                statuses.append(resp.status_code)
+                results.append(resp.json())
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n_threads)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # BEGIN IMMEDIATE 串行化：并发第二审批只产生一次揭盲结果
+    assert statuses.count(200) == 1
+    assert statuses.count(409) == n_threads - 1
+    for body, status in zip(results, statuses):
+        if status == 200:
+            assert body["status"] == "unblinded"
+            assert len(body["sequence"]) == 2
+        else:
+            assert body["detail"]["reason"] == "already_unblinded"
+            assert "sequence" not in body["detail"]
+
+    with TestClient(app) as verify:
+        events = verify.get(
+            f"/experiments/{eid}/emergency-unblind-events"
+        ).json()["events"]
+    # 审计只有一条 window_opened 与一条 unblinded
+    assert [e["action"] for e in events] == ["unblinded", "window_opened"]
+
+
+def test_emergency_unblind_events_audit_has_no_condition_content(
+    client: TestClient,
+) -> None:
+    body, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=1
+    )
+    eid = body["experiment_id"]
+
+    # 无记录时返回空列表
+    empty = client.get(f"/experiments/{eid}/emergency-unblind-events")
+    assert empty.status_code == 200
+    assert empty.json() == {"experiment_id": eid, "events": []}
+
+    assert (
+        emergency_unblind(client, eid, "s1", "alice", "eu-1", "reason-1").status_code
+        == 200
+    )
+    assert (
+        emergency_unblind(client, eid, "s1", "bob", "eu-2", "reason-2").status_code
+        == 200
+    )
+    assert (
+        emergency_unblind(client, eid, "s2", "carol", "eu-3", "reason-3").status_code
+        == 200
+    )
+
+    resp = client.get(f"/experiments/{eid}/emergency-unblind-events")
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["experiment_id"] == eid
+    events = payload["events"]
+    # 按时间倒序（最新在前）
+    assert [(e["subject_id"], e["action"], e["approver_id"]) for e in events] == [
+        ("s2", "window_opened", "carol"),
+        ("s1", "unblinded", "bob"),
+        ("s1", "window_opened", "alice"),
+    ]
+    assert events[0]["id"] > events[1]["id"] > events[2]["id"]
+    assert events[1]["operation_id"] == "eu-2"
+    assert events[1]["reason"] == "reason-2"
+    assert events[0]["window_expires_at"] is not None
+    assert events[1]["window_expires_at"] is None
+    assert all("created_at" in e for e in events)
+    # 审计不含任何条件内容
+    assert_no_sequence_leak(payload)
+    assert all("condition" not in e for e in events)
+
+    # limit / offset 分页
+    page1 = client.get(
+        f"/experiments/{eid}/emergency-unblind-events?limit=2"
+    ).json()["events"]
+    assert [e["operation_id"] for e in page1] == ["eu-3", "eu-2"]
+    page2 = client.get(
+        f"/experiments/{eid}/emergency-unblind-events?limit=2&offset=2"
+    ).json()["events"]
+    assert [e["operation_id"] for e in page2] == ["eu-1"]
+
+    # 非法分页参数
+    assert (
+        client.get(f"/experiments/{eid}/emergency-unblind-events?limit=0").status_code
+        == 422
+    )
+    assert (
+        client.get(
+            f"/experiments/{eid}/emergency-unblind-events?limit=501"
+        ).status_code
+        == 422
+    )
+    assert (
+        client.get(
+            f"/experiments/{eid}/emergency-unblind-events?offset=-1"
+        ).status_code
+        == 422
+    )
+
+    # 实验不存在返回 404
+    assert client.get("/experiments/missing/emergency-unblind-events").status_code == 404
+
+
+def test_emergency_unblind_payload_validation(client: TestClient) -> None:
+    body, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=1
+    )
+    eid = body["experiment_id"]
+    base = {
+        "subject_id": "s1",
+        "approver_id": "alice",
+        "operation_id": "op",
+        "reason": "r",
+    }
+    for field in ("subject_id", "approver_id", "operation_id", "reason"):
+        missing = {k: v for k, v in base.items() if k != field}
+        assert (
+            client.post(
+                f"/experiments/{eid}/emergency-unblind", json=missing
+            ).status_code
+            == 422
+        )
+        empty = {**base, field: ""}
+        assert (
+            client.post(
+                f"/experiments/{eid}/emergency-unblind", json=empty
+            ).status_code
+            == 422
+        )
+
+
+def test_legacy_database_supports_emergency_unblind_after_migration(
+    tmp_path, monkeypatch
+) -> None:
+    db_path = tmp_path / "legacy-emergency.db"
+    monkeypatch.setenv("DATABASE_PATH", str(db_path))
+
+    # 模拟旧版本数据库：只有 experiments / assignments 两张表
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE experiments (
+                id TEXT PRIMARY KEY,
+                conditions TEXT NOT NULL,
+                seed INTEGER NOT NULL,
+                group_size INTEGER NOT NULL,
+                num_subjects INTEGER NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE assignments (
+                experiment_id TEXT NOT NULL REFERENCES experiments(id),
+                subject_id TEXT NOT NULL,
+                sequence_index INTEGER NOT NULL,
+                sequence TEXT NOT NULL,
+                PRIMARY KEY (experiment_id, subject_id)
+            );
+            """
+        )
+        conn.execute(
+            "INSERT INTO experiments "
+            "(id, conditions, seed, group_size, num_subjects, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("legacy-eu", '["A","B"]', 1, 2, 2, "2026-01-01T00:00:00+00:00"),
+        )
+        conn.execute(
+            "INSERT INTO assignments "
+            "(experiment_id, subject_id, sequence_index, sequence) "
+            "VALUES (?, ?, ?, ?)",
+            ("legacy-eu", "s1", 0, '["A","B"]'),
+        )
+        conn.execute(
+            "INSERT INTO assignments "
+            "(experiment_id, subject_id, sequence_index, sequence) "
+            "VALUES (?, ?, ?, ?)",
+            ("legacy-eu", "s2", 1, '["B","A"]'),
+        )
+
+    # 启动自动建表迁移后，紧急揭盲完整链路在旧库上可用
+    with TestClient(app) as migrated:
+        opened = migrated.post(
+            "/experiments/legacy-eu/emergency-unblind",
+            json={
+                "subject_id": "s1",
+                "approver_id": "alice",
+                "operation_id": "eu-1",
+                "reason": "SAE",
+            },
+        )
+        assert opened.status_code == 200
+        assert opened.json()["status"] == "pending_second_approval"
+        assert_no_sequence_leak(opened.json())
+
+        done = migrated.post(
+            "/experiments/legacy-eu/emergency-unblind",
+            json={
+                "subject_id": "s1",
+                "approver_id": "bob",
+                "operation_id": "eu-2",
+                "reason": "SAE",
+            },
+        )
+        assert done.status_code == 200
+        # 返回的正是旧库 assignments 中保存的完整序列
+        assert done.json()["sequence"] == ["A", "B"]
+
+        events = migrated.get(
+            "/experiments/legacy-eu/emergency-unblind-events"
+        ).json()["events"]
+        assert [e["action"] for e in events] == ["unblinded", "window_opened"]
+        assert_no_sequence_leak(events)

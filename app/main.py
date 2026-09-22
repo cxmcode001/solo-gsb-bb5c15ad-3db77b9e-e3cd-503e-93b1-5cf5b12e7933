@@ -6,6 +6,8 @@
 
 完整条件序列仅保存在服务端，通过推进接口按周期受控揭盲：
 创建与详情接口只返回受试者名册，不暴露任何后续周期安排。
+另提供双人审批（15 分钟授权窗口）的实验级紧急揭盲通道，
+审批与最终揭盲在单个 SQLite 写事务内完成，审计记录不含条件内容。
 """
 
 from __future__ import annotations
@@ -25,6 +27,9 @@ from .schemas import (
     AdvanceRequest,
     CompleteOut,
     CompleteRequest,
+    EmergencyUnblindEventsOut,
+    EmergencyUnblindOut,
+    EmergencyUnblindRequest,
     ExperimentCreate,
     ExperimentOut,
     ExperimentSummary,
@@ -49,7 +54,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Crossover Experiment Order Balancer",
     description="基于 Williams 平衡拉丁方的交叉实验顺序分配与按周期受控揭盲服务",
-    version="1.5.0",
+    version="1.6.0",
     lifespan=lifespan,
 )
 
@@ -528,6 +533,92 @@ def list_state_events(
     offset: int = Query(default=0, ge=0),
 ) -> dict:
     events = db.list_state_events(experiment_id, limit=limit, offset=offset)
+    if events is None:
+        raise HTTPException(status_code=404, detail="experiment not found")
+    return {"experiment_id": experiment_id, "events": events}
+
+
+@app.post(
+    "/experiments/{experiment_id}/emergency-unblind",
+    response_model=EmergencyUnblindOut,
+    response_model_exclude_none=True,
+    summary=(
+        "实验级紧急揭盲（双人审批）：首个审批人开启 15 分钟授权窗口，"
+        "窗口内第二个不同审批人批准后才一次性返回该受试者完整条件序列；"
+        "审批与最终揭盲在单个 SQLite 写事务内完成"
+    ),
+)
+def emergency_unblind(experiment_id: str, payload: EmergencyUnblindRequest) -> dict:
+    try:
+        result = db.emergency_unblind(
+            experiment_id,
+            payload.subject_id,
+            payload.approver_id,
+            payload.operation_id,
+            payload.reason,
+        )
+    except db.EmergencyOperationIdConflictError:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "operation_id 已被其他紧急揭盲申请占用",
+                "reason": "operation_id_conflict",
+                "operation_id": payload.operation_id,
+            },
+        )
+    except db.EmergencySameApproverError:
+        # 双人复核未满足：不揭露任何条件 / 序列
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "第二审批人必须与首个审批人不同",
+                "reason": "same_approver",
+            },
+        )
+    except db.EmergencyAlreadyUnblindedError:
+        # 一次性揭盲不可重复：不揭露任何条件 / 序列
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "该受试者已完成紧急揭盲，不可重复申请",
+                "reason": "already_unblinded",
+                "subject_id": payload.subject_id,
+            },
+        )
+    except db.EmergencyWindowExpiredError:
+        # 窗口过期：不揭露任何条件 / 序列，可重新发起首个审批开启新窗口
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "授权窗口已过期，本次申请被拒绝；可重新发起首个审批",
+                "reason": "window_expired",
+            },
+        )
+    if result is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "message": "实验或受试者不存在",
+                "experiment_id": experiment_id,
+                "subject_id": payload.subject_id,
+            },
+        )
+    return result
+
+
+@app.get(
+    "/experiments/{experiment_id}/emergency-unblind-events",
+    response_model=EmergencyUnblindEventsOut,
+    summary="查询紧急揭盲审计记录（不含条件内容），按时间倒序分页",
+)
+def list_emergency_unblind_events(
+    experiment_id: str,
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+) -> dict:
+    events = db.list_emergency_unblind_events(
+        experiment_id, limit=limit, offset=offset
+    )
     if events is None:
         raise HTTPException(status_code=404, detail="experiment not found")
     return {"experiment_id": experiment_id, "events": events}

@@ -298,3 +298,64 @@ class StateTransitionBatchOut(BaseModel):
     batch_operation_id: str
     # 结果严格按请求 operations 的输入顺序返回
     results: list[StateEventOut]
+
+
+class EmergencyUnblindRequest(BaseModel):
+    """紧急揭盲审批请求：每次审批（首开窗口或窗口内第二审批）调用一次。"""
+
+    subject_id: str = Field(..., min_length=1, description="受试者 ID")
+    approver_id: str = Field(
+        ...,
+        min_length=1,
+        description="审批人 ID；完成揭盲的第二审批人必须与首个审批人不同",
+    )
+    operation_id: str = Field(
+        ...,
+        min_length=1,
+        description="本次审批的唯一操作键（如 UUID），相同操作重试必须复用",
+    )
+    reason: str = Field(
+        ..., min_length=1, description="紧急揭盲原因（必填），随审计记录持久化"
+    )
+
+
+class EmergencyUnblindOut(BaseModel):
+    """紧急揭盲审批结果。
+
+    ``pending_second_approval``：首个审批已开启 15 分钟授权窗口，
+    响应不含任何条件内容；``unblinded``：窗口内第二个不同审批人批准，
+    一次性返回该受试者完整条件序列。
+    """
+
+    experiment_id: str
+    subject_id: str
+    operation_id: str
+    status: Literal["pending_second_approval", "unblinded"]
+    first_approver_id: str
+    opened_at: str
+    window_expires_at: str
+    second_approver_id: str | None = None
+    revealed_at: str | None = None
+    # 仅 unblinded 时返回：该受试者的完整条件序列
+    sequence: list[str] | None = None
+
+
+class EmergencyUnblindEventOut(BaseModel):
+    """一条紧急揭盲审计记录（只含审批元数据，不含任何条件内容）。"""
+
+    id: int
+    experiment_id: str
+    subject_id: str
+    action: Literal["window_opened", "unblinded", "window_expired"]
+    approver_id: str
+    operation_id: str | None = None
+    reason: str | None = None
+    window_expires_at: str | None = None
+    created_at: str
+
+
+class EmergencyUnblindEventsOut(BaseModel):
+    """紧急揭盲审计列表，按时间倒序（最新在前）。"""
+
+    experiment_id: str
+    events: list[EmergencyUnblindEventOut]

@@ -26,6 +26,13 @@
 * ``state_transition_batches``：跨实验批量状态切换（暂停 / 恢复）的幂等结果，
   按 ``batch_operation_id`` 全局去重，保存首次请求绑定的有序操作列表
   与首次执行结果；整批在同一事务内“先统一校验、再一起写入”。
+* ``emergency_unblind_operations``：紧急揭盲的幂等结果，按
+  ``(实验, operation_id)`` 去重，保存首次请求绑定的受试者 / 审批人 / 原因
+  与首次结果（完成揭盲的首次结果含完整条件序列，仅供相同 operation_id
+  幂等重放）。
+* ``emergency_unblind_events``：紧急揭盲的追加式审计记录
+  （``window_opened`` / ``unblinded`` / ``window_expired``），只含审批人、
+  原因与时间等元数据，**不含任何条件内容**；按自增 id 时间倒序分页查询。
 """
 
 from __future__ import annotations
@@ -41,6 +48,9 @@ from typing import Any
 
 # 写事务排队等待锁的时间，配合 BEGIN IMMEDIATE 保证并发推进串行化
 BUSY_TIMEOUT_MS = 10_000
+
+# 紧急揭盲授权窗口：首个审批人开启后，第二个不同审批人必须在窗口内批准
+EMERGENCY_UNBLIND_WINDOW_SECONDS = 15 * 60
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS experiments (
@@ -141,6 +151,32 @@ CREATE TABLE IF NOT EXISTS state_transition_batches (
     results            TEXT NOT NULL,     -- JSON：首次结果（按输入顺序的审计事件列表）
     created_at         TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS emergency_unblind_operations (
+    experiment_id TEXT NOT NULL REFERENCES experiments(id),
+    operation_id  TEXT NOT NULL,
+    subject_id    TEXT NOT NULL,       -- 首次请求绑定的受试者
+    approver_id   TEXT NOT NULL,       -- 首次请求绑定的审批人
+    reason        TEXT NOT NULL,       -- 首次请求绑定的原因
+    result        TEXT NOT NULL,       -- JSON：该操作的首次结果
+                                       -- （unblinded 含完整序列，仅供幂等重放）
+    created_at    TEXT NOT NULL,
+    PRIMARY KEY (experiment_id, operation_id)
+);
+
+CREATE TABLE IF NOT EXISTS emergency_unblind_events (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,  -- 单调主键，兼作时间倒序
+    experiment_id     TEXT NOT NULL REFERENCES experiments(id),
+    subject_id        TEXT NOT NULL,
+    action            TEXT NOT NULL,     -- window_opened | unblinded | window_expired
+    approver_id       TEXT NOT NULL,     -- 触发本事件的审批人
+    operation_id      TEXT,              -- 触发操作键；window_expired 为 NULL
+                                         -- （失败不消耗幂等键）
+    reason            TEXT,              -- 触发请求携带的原因
+    window_expires_at TEXT,              -- 仅 window_opened：授权窗口截止时刻
+    created_at        TEXT NOT NULL,
+    UNIQUE (experiment_id, operation_id)
+);
 """
 
 
@@ -235,6 +271,32 @@ class BatchStateTransitionsRejectedError(Exception):
         super().__init__(
             f"batch state transitions rejected: {len(failures)} failure(s)"
         )
+
+
+class EmergencySameApproverError(Exception):
+    """第二审批人与首个审批人相同：双人复核未满足，不得揭盲。
+
+    冲突路径不携带任何条件 / 序列信息。
+    """
+
+
+class EmergencyAlreadyUnblindedError(Exception):
+    """该受试者已完成紧急揭盲：一次性揭盲不可重复申请。
+
+    冲突路径不携带任何条件 / 序列信息。
+    """
+
+
+class EmergencyWindowExpiredError(Exception):
+    """授权窗口已过期：过期审计已在写事务内落盘提交，本次申请被拒绝。
+
+    冲突路径不携带任何条件 / 序列信息；失败不消耗 operation_id，
+    重新发起首个审批即可开启新窗口。
+    """
+
+
+class EmergencyOperationIdConflictError(Exception):
+    """operation_id 已被另一个紧急揭盲申请（不同受试者 / 审批人 / 原因）占用。"""
 
 
 class InvalidStateTransitionError(Exception):
@@ -1411,6 +1473,288 @@ def _state_transition_batch_locked(
         "results": final_results,
         "_replayed": False,
     }
+
+
+def emergency_unblind(
+    experiment_id: str,
+    subject_id: str,
+    approver_id: str,
+    operation_id: str,
+    reason: str,
+) -> dict[str, Any] | None:
+    """双人审批的紧急揭盲：每次调用即一次审批，全部在单个写事务内处理。
+
+    在单个 ``BEGIN IMMEDIATE`` 事务内完成：
+
+    1. 幂等检查：``(experiment_id, operation_id)`` 已存在时，仅当本次
+       ``subject_id`` / ``approver_id`` / ``reason`` 与首次完全一致才重放
+       首次结果（首开窗口的重放仍返回待审批回执，完成揭盲的重放仍返回
+       首次序列）；任一字段不同抛出
+       :class:`EmergencyOperationIdConflictError`；
+    2. 存在性检查：实验与受试者必须存在，否则返回 ``None``（404）；
+    3. 会话状态机（以该受试者最近一次审计事件判定，同一事务快照）：
+
+       * 无会话或上一会话已过期关闭：本次为**首个审批**，开启 15 分钟
+         授权窗口，落 ``window_opened`` 审计与幂等结果，返回待审批回执
+         （不含任何条件内容）；
+       * 上一会话已完成揭盲：抛出 :class:`EmergencyAlreadyUnblindedError`
+         （一次性揭盲不可重复）；
+       * 窗口仍在有效期内：审批人与首个审批人相同则抛出
+         :class:`EmergencySameApproverError`；不同即为**第二审批**，
+         同事务落 ``unblinded`` 审计与幂等结果，一次性返回完整条件序列；
+       * 窗口已过期：同事务落 ``window_expired`` 审计并提交，随后抛出
+         :class:`EmergencyWindowExpiredError`（不消耗 operation_id，
+         重新发起即可开启新窗口）。
+
+    并发第二审批由 ``BEGIN IMMEDIATE`` 串行化：只有第一个提交的事务看到
+    “窗口仍开启”并完成揭盲，其余看到已完成而 409，序列只产生一次结果。
+    """
+    conn = get_connection()
+    try:
+        conn.isolation_level = None
+        conn.execute("BEGIN IMMEDIATE")
+        committed = False
+        result: dict[str, Any] | None = None
+        try:
+            result = _emergency_unblind_locked(
+                conn, experiment_id, subject_id, approver_id, operation_id, reason
+            )
+            if result is not None and result.pop("_commit", False):
+                conn.execute("COMMIT")
+                committed = True
+        finally:
+            if not committed:
+                # 幂等重放（只读）、404 或异常时结束事务
+                conn.rollback()
+    finally:
+        conn.close()
+    if result is not None and result.pop("_error", None) == "window_expired":
+        # 过期审计已随事务提交；拒绝本次申请（不泄露任何序列）
+        raise EmergencyWindowExpiredError()
+    return result
+
+
+def _emergency_unblind_locked(
+    conn: sqlite3.Connection,
+    experiment_id: str,
+    subject_id: str,
+    approver_id: str,
+    operation_id: str,
+    reason: str,
+) -> dict[str, Any] | None:
+    # 1) 幂等命中：返回该操作的首次结果，绝不重复执行
+    operation_row = conn.execute(
+        "SELECT subject_id, approver_id, reason, result "
+        "FROM emergency_unblind_operations "
+        "WHERE experiment_id = ? AND operation_id = ?",
+        (experiment_id, operation_id),
+    ).fetchone()
+    if operation_row is not None:
+        if (
+            operation_row["subject_id"] != subject_id
+            or operation_row["approver_id"] != approver_id
+            or operation_row["reason"] != reason
+        ):
+            raise EmergencyOperationIdConflictError()
+        replay = json.loads(operation_row["result"])
+        replay["_commit"] = False
+        return replay
+
+    # 2) 实验与受试者必须存在（404 路径不泄露任何信息）
+    experiment_row = conn.execute(
+        "SELECT 1 FROM experiments WHERE id = ?", (experiment_id,)
+    ).fetchone()
+    if experiment_row is None:
+        return None
+    assignment_row = conn.execute(
+        "SELECT sequence FROM assignments "
+        "WHERE experiment_id = ? AND subject_id = ?",
+        (experiment_id, subject_id),
+    ).fetchone()
+    if assignment_row is None:
+        return None
+
+    # 3) 该受试者最近一次紧急揭盲会话（写锁内读取，期间无其他写入）
+    last_event = conn.execute(
+        "SELECT action, approver_id, window_expires_at, created_at "
+        "FROM emergency_unblind_events "
+        "WHERE experiment_id = ? AND subject_id = ? "
+        "ORDER BY id DESC LIMIT 1",
+        (experiment_id, subject_id),
+    ).fetchone()
+
+    # 服务端时间在锁内读取：窗口判定与审计 / 结果写入原子一致
+    now = utc_now()
+    now_iso = now.isoformat()
+
+    if last_event is not None and last_event["action"] == "unblinded":
+        # 一次性揭盲：已完成即永久关闭（重放请使用原 operation_id）
+        raise EmergencyAlreadyUnblindedError()
+
+    if last_event is not None and last_event["action"] == "window_opened":
+        window_expires_at = datetime.fromisoformat(last_event["window_expires_at"])
+        if now <= window_expires_at:
+            if approver_id == last_event["approver_id"]:
+                # 双人复核：第二审批人必须不同于首个审批人
+                raise EmergencySameApproverError()
+            # 窗口内第二个不同审批人：一次性返回完整条件序列
+            sequence = json.loads(assignment_row["sequence"])
+            body = {
+                "experiment_id": experiment_id,
+                "subject_id": subject_id,
+                "operation_id": operation_id,
+                "status": "unblinded",
+                "first_approver_id": last_event["approver_id"],
+                "second_approver_id": approver_id,
+                "opened_at": last_event["created_at"],
+                "window_expires_at": last_event["window_expires_at"],
+                "revealed_at": now_iso,
+                "sequence": sequence,
+            }
+            conn.execute(
+                "INSERT INTO emergency_unblind_events "
+                "(experiment_id, subject_id, action, approver_id, operation_id, "
+                "reason, window_expires_at, created_at) "
+                "VALUES (?, ?, 'unblinded', ?, ?, ?, NULL, ?)",
+                (
+                    experiment_id,
+                    subject_id,
+                    approver_id,
+                    operation_id,
+                    reason,
+                    now_iso,
+                ),
+            )
+            _insert_emergency_operation(
+                conn,
+                experiment_id,
+                operation_id,
+                subject_id,
+                approver_id,
+                reason,
+                body,
+                now_iso,
+            )
+            body["_commit"] = True
+            return body
+        # 窗口已过期：落过期审计（随事务提交）后拒绝，不泄露任何序列
+        conn.execute(
+            "INSERT INTO emergency_unblind_events "
+            "(experiment_id, subject_id, action, approver_id, operation_id, "
+            "reason, window_expires_at, created_at) "
+            "VALUES (?, ?, 'window_expired', ?, NULL, ?, NULL, ?)",
+            (experiment_id, subject_id, approver_id, reason, now_iso),
+        )
+        return {"_error": "window_expired", "_commit": True}
+
+    # 4) 无会话或上一会话已过期关闭：首个审批人开启 15 分钟授权窗口
+    window_expires_at = (
+        now + timedelta(seconds=EMERGENCY_UNBLIND_WINDOW_SECONDS)
+    ).isoformat()
+    body = {
+        "experiment_id": experiment_id,
+        "subject_id": subject_id,
+        "operation_id": operation_id,
+        "status": "pending_second_approval",
+        "first_approver_id": approver_id,
+        "opened_at": now_iso,
+        "window_expires_at": window_expires_at,
+    }
+    conn.execute(
+        "INSERT INTO emergency_unblind_events "
+        "(experiment_id, subject_id, action, approver_id, operation_id, "
+        "reason, window_expires_at, created_at) "
+        "VALUES (?, ?, 'window_opened', ?, ?, ?, ?, ?)",
+        (
+            experiment_id,
+            subject_id,
+            approver_id,
+            operation_id,
+            reason,
+            window_expires_at,
+            now_iso,
+        ),
+    )
+    _insert_emergency_operation(
+        conn,
+        experiment_id,
+        operation_id,
+        subject_id,
+        approver_id,
+        reason,
+        body,
+        now_iso,
+    )
+    body["_commit"] = True
+    return body
+
+
+def _insert_emergency_operation(
+    conn: sqlite3.Connection,
+    experiment_id: str,
+    operation_id: str,
+    subject_id: str,
+    approver_id: str,
+    reason: str,
+    body: dict[str, Any],
+    created_at: str,
+) -> None:
+    """落盘一次紧急揭盲操作的幂等结果（待审批回执 / 首次揭盲序列）。"""
+    conn.execute(
+        "INSERT INTO emergency_unblind_operations "
+        "(experiment_id, operation_id, subject_id, approver_id, reason, "
+        "result, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            experiment_id,
+            operation_id,
+            subject_id,
+            approver_id,
+            reason,
+            json.dumps(body, ensure_ascii=False),
+            created_at,
+        ),
+    )
+
+
+def _emergency_unblind_event_dict(row: sqlite3.Row) -> dict[str, Any]:
+    """审计行转事件字典；审计记录不含任何条件内容。"""
+    return {
+        "id": row["id"],
+        "experiment_id": row["experiment_id"],
+        "subject_id": row["subject_id"],
+        "action": row["action"],
+        "approver_id": row["approver_id"],
+        "operation_id": row["operation_id"],
+        "reason": row["reason"],
+        "window_expires_at": row["window_expires_at"],
+        "created_at": row["created_at"],
+    }
+
+
+def list_emergency_unblind_events(
+    experiment_id: str,
+    limit: int = 100,
+    offset: int = 0,
+) -> list[dict[str, Any]] | None:
+    """按时间倒序（最新在前）返回紧急揭盲审计记录。
+
+    审计记录只含审批人、动作与时间等元数据，不含任何条件内容。
+    实验不存在时返回 ``None``。
+    """
+    with closing(get_connection()) as conn:
+        experiment_row = conn.execute(
+            "SELECT 1 FROM experiments WHERE id = ?", (experiment_id,)
+        ).fetchone()
+        if experiment_row is None:
+            return None
+        # id 为自增主键，与 created_at 同序；倒序即按时间倒序
+        rows = conn.execute(
+            "SELECT * FROM emergency_unblind_events "
+            "WHERE experiment_id = ? ORDER BY id DESC LIMIT ? OFFSET ?",
+            (experiment_id, limit, offset),
+        ).fetchall()
+    return [_emergency_unblind_event_dict(row) for row in rows]
 
 
 def list_state_events(
